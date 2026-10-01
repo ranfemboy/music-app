@@ -3,23 +3,27 @@ import 'package:just_audio/just_audio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:math';
 import '../models/song.dart';
-import '../models/sample_data.dart';
+import '../services/youtube_service.dart';
 
 enum RepeatMode { off, one, all }
 
 class MusicProvider extends ChangeNotifier {
   final AudioPlayer _player = AudioPlayer();
-  
-  List<Song> _songs = sampleSongs;
+  final YoutubeService _youtube = YoutubeService();
+
+  List<Song> _songs = [];
   List<Song> _queue = [];
   List<Song> _recentlyPlayed = [];
   List<Song> _favorites = [];
   List<Playlist> _playlists = [];
-  
+  List<Song> _searchResults = [];
+
   Song? _currentSong;
   int _currentIndex = 0;
   bool _isPlaying = false;
   bool _isShuffle = false;
+  bool _isLoading = false;
+  bool _isBuffering = false;
   RepeatMode _repeatMode = RepeatMode.off;
   Duration _currentPosition = Duration.zero;
   Duration _totalDuration = Duration.zero;
@@ -27,30 +31,23 @@ class MusicProvider extends ChangeNotifier {
   bool _isMuted = false;
   String _searchQuery = '';
 
-  // Getters
   List<Song> get songs => _songs;
   List<Song> get queue => _queue;
   List<Song> get recentlyPlayed => _recentlyPlayed;
   List<Song> get favorites => _favorites;
   List<Playlist> get playlists => _playlists;
+  List<Song> get searchResults => _searchResults;
   Song? get currentSong => _currentSong;
   bool get isPlaying => _isPlaying;
   bool get isShuffle => _isShuffle;
+  bool get isLoading => _isLoading;
+  bool get isBuffering => _isBuffering;
   RepeatMode get repeatMode => _repeatMode;
   Duration get currentPosition => _currentPosition;
   Duration get totalDuration => _totalDuration;
   double get volume => _volume;
   bool get isMuted => _isMuted;
   String get searchQuery => _searchQuery;
-
-  List<Song> get searchResults {
-    if (_searchQuery.isEmpty) return _songs;
-    return _songs.where((s) =>
-      s.title.toLowerCase().contains(_searchQuery.toLowerCase()) ||
-      s.artist.toLowerCase().contains(_searchQuery.toLowerCase()) ||
-      s.album.toLowerCase().contains(_searchQuery.toLowerCase())
-    ).toList();
-  }
 
   MusicProvider() {
     _initPlayer();
@@ -72,6 +69,8 @@ class MusicProvider extends ChangeNotifier {
 
     _player.playerStateStream.listen((state) {
       _isPlaying = state.playing;
+      _isBuffering = state.processingState == ProcessingState.buffering ||
+          state.processingState == ProcessingState.loading;
       if (state.processingState == ProcessingState.completed) {
         _onSongComplete();
       }
@@ -99,21 +98,65 @@ class MusicProvider extends ChangeNotifier {
     }
   }
 
+  Future<void> searchYoutube(String query) async {
+    if (query.isEmpty) {
+      _searchResults = [];
+      _searchQuery = '';
+      notifyListeners();
+      return;
+    }
+    _isLoading = true;
+    _searchQuery = query;
+    notifyListeners();
+
+    try {
+      final results = await _youtube.searchSongs(query);
+      _searchResults = results.map((r) => Song(
+        id: r['id']!,
+        title: r['title']!,
+        artist: r['artist']!,
+        thumbnailUrl: r['thumbnail'],
+      )).toList();
+    } catch (e) {
+      _searchResults = [];
+      debugPrint('Search error: $e');
+    }
+
+    _isLoading = false;
+    notifyListeners();
+  }
+
   Future<void> playSong(Song song, {List<Song>? playlist}) async {
     try {
+      _isBuffering = true;
       _currentSong = song;
-      _queue = playlist ?? _songs;
+      _queue = playlist ?? [song];
       _currentIndex = _queue.indexWhere((s) => s.id == song.id);
       if (_currentIndex == -1) _currentIndex = 0;
+      notifyListeners();
 
-      await _player.setAsset(song.audioPath);
+      final streamUrl = await _youtube.getStreamUrl(song.id);
+      if (streamUrl == null) {
+        _isBuffering = false;
+        notifyListeners();
+        return;
+      }
+
+      await _player.setUrl(streamUrl);
       await _player.play();
       _isPlaying = true;
+      _isBuffering = false;
 
       _addToRecentlyPlayed(song);
+      if (!_songs.any((s) => s.id == song.id)) {
+        _songs.insert(0, song);
+      }
       notifyListeners();
     } catch (e) {
-      debugPrint('Error playing song: $e');
+      _isBuffering = false;
+      _isPlaying = false;
+      notifyListeners();
+      debugPrint('Play error: $e');
     }
   }
 
@@ -161,10 +204,11 @@ class MusicProvider extends ChangeNotifier {
   Future<void> toggleMute() async {
     if (_isMuted) {
       await setVolume(_volume == 0 ? 1.0 : _volume);
+      _isMuted = false;
     } else {
       await _player.setVolume(0);
+      _isMuted = true;
     }
-    _isMuted = !_isMuted;
     notifyListeners();
   }
 
@@ -197,6 +241,9 @@ class MusicProvider extends ChangeNotifier {
       } else {
         _favorites.removeWhere((s) => s.id == song.id);
       }
+      if (_currentSong?.id == song.id) {
+        _currentSong = _songs[index];
+      }
       _saveFavorites();
       notifyListeners();
     }
@@ -227,8 +274,10 @@ class MusicProvider extends ChangeNotifier {
   }
 
   void addToQueue(Song song) {
-    _queue.add(song);
-    notifyListeners();
+    if (!_queue.any((s) => s.id == song.id)) {
+      _queue.add(song);
+      notifyListeners();
+    }
   }
 
   void removeFromQueue(int index) {
@@ -276,6 +325,7 @@ class MusicProvider extends ChangeNotifier {
   @override
   void dispose() {
     _player.dispose();
+    _youtube.dispose();
     super.dispose();
   }
 }
