@@ -2,28 +2,42 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 class YoutubeService {
-  // Invidious public instances
-  final List<String> _instances = [
-    'https://invidious.snopyta.org',
-    'https://yewtu.be',
-    'https://invidious.kavin.rocks',
+  final _client = http.Client();
+
+  // Piped instances - handle decrypt otomatis
+  final List<String> _pipedInstances = [
+    'https://pipedapi.kavin.rocks',
+    'https://piped-api.garudalinux.org',
+    'https://api.piped.projectsegfau.lt',
+    'https://pipedapi.adminforge.de',
   ];
 
   Future<List<Map<String, String>>> searchSongs(String query) async {
-    for (final instance in _instances) {
+    for (final instance in _pipedInstances) {
       try {
         final url = Uri.parse(
-          '$instance/api/v1/search?q=${Uri.encodeComponent(query)}&type=video'
+          '$instance/search?q=${Uri.encodeComponent(query)}&filter=music_songs'
         );
-        final res = await http.get(url).timeout(const Duration(seconds: 10));
+        final res = await _client.get(url, headers: {
+          'Accept': 'application/json',
+        }).timeout(const Duration(seconds: 10));
+
         if (res.statusCode == 200) {
-          final List data = jsonDecode(res.body);
-          return data.take(20).map((v) => {
-            'id': v['videoId'].toString(),
-            'title': v['title'].toString(),
-            'artist': v['author'].toString(),
-            'thumbnail': 'https://img.youtube.com/vi/${v['videoId']}/0.jpg',
-          }).toList();
+          final data = jsonDecode(res.body);
+          final items = data['items'] as List?;
+          if (items == null || items.isEmpty) continue;
+
+          return items.take(20).map((v) {
+            final id = v['url']?.toString().replaceAll('/watch?v=', '') ?? '';
+            return {
+              'id': id,
+              'title': v['title']?.toString() ?? 'Unknown',
+              'artist': v['uploaderName']?.toString() ?? 'Unknown',
+              'thumbnail': v['thumbnail']?.toString() ?? 
+                'https://img.youtube.com/vi/$id/mqdefault.jpg',
+              'duration': v['duration']?.toString() ?? '0',
+            };
+          }).where((v) => v['id']!.isNotEmpty).toList();
         }
       } catch (e) {
         continue;
@@ -33,21 +47,26 @@ class YoutubeService {
   }
 
   Future<String?> getStreamUrl(String videoId) async {
-    for (final instance in _instances) {
+    for (final instance in _pipedInstances) {
       try {
-        final url = Uri.parse('$instance/api/v1/videos/$videoId');
-        final res = await http.get(url).timeout(const Duration(seconds: 10));
+        final url = Uri.parse('$instance/streams/$videoId');
+        final res = await _client.get(url, headers: {
+          'Accept': 'application/json',
+        }).timeout(const Duration(seconds: 15));
+
         if (res.statusCode == 200) {
           final data = jsonDecode(res.body);
-          final formats = data['adaptiveFormats'] as List?;
-          if (formats != null) {
-            final audioFormats = formats
-              .where((f) => f['type'].toString().contains('audio'))
-              .toList();
-            if (audioFormats.isNotEmpty) {
-              audioFormats.sort((a, b) =>
-                (b['bitrate'] ?? 0).compareTo(a['bitrate'] ?? 0));
-              return audioFormats.first['url'].toString();
+          
+          // Coba audioStreams dulu
+          final audioStreams = data['audioStreams'] as List?;
+          if (audioStreams != null && audioStreams.isNotEmpty) {
+            // Sort by bitrate, ambil yang tertinggi
+            audioStreams.sort((a, b) =>
+              (b['bitrate'] ?? 0).compareTo(a['bitrate'] ?? 0));
+            
+            final streamUrl = audioStreams.first['url']?.toString();
+            if (streamUrl != null && streamUrl.isNotEmpty) {
+              return streamUrl;
             }
           }
         }
@@ -58,5 +77,7 @@ class YoutubeService {
     return null;
   }
 
-  void dispose() {}
+  void dispose() {
+    _client.close();
+  }
 }
